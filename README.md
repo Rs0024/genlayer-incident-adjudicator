@@ -1,6 +1,8 @@
 # GenLayer Incident Severity Adjudicator
 
-An Intelligent Contract that classifies workplace safety incidents on-chain — with a validator design that tolerates LLM scoring noise in the middle of the scale while refusing any tolerance at the critical end.
+**Live demo:** https://rs0024.github.io/genlayer-incident-adjudicator/
+
+An Intelligent Contract that classifies workplace safety incidents on-chain — with a validator design that tolerates LLM scoring noise inside a band while refusing to let the critical boundary blur.
 
 ## Problem
 
@@ -14,20 +16,39 @@ But naively putting an LLM behind it doesn't work either: ask two models to scor
 
 On `assess_incident(incident_id, report)` the leader classifies the narrative into four fields: `category`, `severity` (1-10), `escalate`, and a free-text `rationale`.
 
-Each validator independently re-runs the same classification on the same report, then applies a **three-part comparison**:
+Each validator independently re-runs the same classification on the same report, then applies a four-part comparison:
 
 | Field | Rule | Why |
 |---|---|---|
-| `category` | exact match | It's an enum with real regulatory meaning — `lost_time` vs `first_aid` changes reportability |
-| `escalate` | exact match | It's the actionable output; a disagreement here is a disagreement about what happens next |
-| `severity` | ±1 tolerance, **but exact match if either side scores ≥8** | Two competent assessors differ by a point in the middle of the scale; nobody should be sloppy about a critical call |
+| `category` | exact match | It's an enum with regulatory meaning — `lost_time` vs `first_aid` changes reportability |
+| `escalate` | exact match | It's the actionable output; disagreement here is disagreement about what happens next |
+| `severity` | both sides must land on the same side of the critical threshold, then ±1 within that band | Two competent assessors differ by a point mid-scale, but must never disagree about whether something is critical |
 | `rationale` | never compared | Two LLMs always word an explanation differently while agreeing on the verdict |
 
-The critical-band gate is the part worth stealing. A flat ±1 tolerance would let a leader scoring 8 (critical) reach consensus with a validator scoring 7 (not critical) — silently converting a critical incident into a non-critical one at the exact boundary where it matters most. Clamping tolerance to zero above the threshold closes that gap.
+## The boundary problem
+
+The first version of this validator required **exact** severity match whenever either side scored ≥8. The reasoning seemed sound: nobody should be sloppy about a critical call.
+
+In practice it broke. Ask two models to score a fall-from-height with a fractured femur and one says 8, the other 9. Both are calling it critical. Both are right. But exact-match rejected the pair, consensus failed, and the transaction went undetermined — the contract refused to record the most serious incident it was given.
+
+The fix is to gate on the **band**, not the number:
+
+```python
+# both sides must agree which side of the threshold this sits on
+if (ls >= CRITICAL_THRESHOLD) != (vs >= CRITICAL_THRESHOLD):
+    return False
+
+# within whichever band both agree on, allow +/- 1
+return abs(ls - vs) <= 1
+```
+
+This keeps the safety property that mattered — a leader scoring 8 can never reach consensus with a validator scoring 7, so the critical boundary is never silently crossed — while letting 8-vs-9 through, since both agree on what the incident *is*.
+
+The general lesson: when a numeric field has a consequential threshold, the thing validators must agree on is which side of the threshold they're on, not the exact value.
 
 ## Consensus design
 
-Uses `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)` with **numeric tolerance plus categorical exact-match**.
+Uses `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)` with categorical exact-match plus threshold-gated numeric tolerance.
 
 The validator does not inspect the leader's output for schema correctness. Checking that `category` is one of five allowed strings and `severity` is an integer 1-10 would only prove the leader formatted its answer well — it would not verify the classification. The validator instead produces its own independent classification from the same narrative and compares decision fields.
 
@@ -46,42 +67,53 @@ The validator does not inspect the leader's output for schema correctness. Check
 
 **`get_assessment(incident_id: str) -> str`** — view. Returns category, severity and escalation flag.
 
+## Frontend
+
+A browser dApp at [rs0024.github.io/genlayer-incident-adjudicator](https://rs0024.github.io/genlayer-incident-adjudicator/) talks to the deployed contract directly via `genlayer-js` — no backend.
+
+Three sample narratives are built in, one per band. **Assess on-chain** sends a real write transaction and waits for validator consensus; **Read stored assessment** performs a view call. Severity badges are colour-coded by band.
+
+Single static file (`index.html`), zero build step.
+
 ## Test results
 
-Verified on GenLayer Studio in full consensus mode, chosen to exercise each band of the validator:
+Run end-to-end from the browser dApp against the deployed contract:
 
 | Incident | Category | Severity | Escalate | Band exercised |
 |---|---|---|---|---|
-| Coolant leak, area cordoned, no injury | `near_miss` | 2 | no | Low |
-| Chemical splash, wound cleaned and dressed | `first_aid` | 2 | no | Low |
-| Laceration, six sutures, five days restricted duty | `medical_treatment` | 4 | no | **Tolerance band** |
-| Fall from scaffold, fractured femur, eight weeks off | `lost_time` | 8 | **yes** | **Critical, zero tolerance** |
+| Coolant puddle, cordoned off, no injury | `near_miss` | 1 | no | Low |
+| Laceration, six sutures, five days restricted duty | `medical_treatment` | 5 | no | Tolerance band |
+| Fall from scaffold, fractured femur, eight weeks off | `major` | 8 | **yes** | Critical |
 
-All four reached consensus and finalized. The middle case is the one that demonstrates the tolerance rule doing work; the fall case demonstrates the critical gate holding at exactly the threshold where a flat tolerance would have been unsafe.
-
-The `first_aid` result on the chemical splash is correct rather than lenient — cleaning, dressing and topical treatment fall under first aid, not medical treatment, under standard occupational classification.
-
-## Reusing this pattern
-
-The validator shape generalises to any scored assessment where the middle of the scale is noisy but one end is consequential:
-
-- Credit or counterparty risk scoring with a hard gate at default probability
-- Content moderation severity with zero tolerance above a takedown threshold
-- Equipment condition scoring where "run to failure" vs "shut down now" must not blur
-- Vendor SLA breach grading with an exact gate on penalty-triggering tiers
-
-Keep the three-part comparison: exact match on categorical decisions, tolerance on the noisy numeric, zero tolerance above the consequential threshold, and no comparison at all on free-text reasoning.
+All three reached consensus and finalized. The critical case is the one that failed under the original exact-match gate and passes under the band gate.
 
 ## Limitations
 
-- The severity scale is defined in the prompt, not enforced in code — a validator disagreeing on scale interpretation shows up as a category or escalation mismatch rather than an explicit error
-- Very long incident narratives may need truncation
-- The category enum is fixed to a common occupational scheme; other regimes need the prompt and gate threshold adjusted together
-- `escalate` is derived by the LLM rather than computed from `severity` and `category` in code, so it is compared as its own decision field rather than trusted as a function of the others
+- **Category can shift between runs.** The same fall narrative classified as `lost_time` in one run and `major` in another. Both are defensible readings, and validators agreed *within* each run — but the contract does not currently guarantee run-to-run stability on category. Narrowing the enum or giving each category an explicit definition in the prompt would tighten this.
+- The severity scale lives in the prompt, not in code. A validator interpreting the scale differently surfaces as a category or escalation mismatch rather than an explicit error.
+- `escalate` is produced by the LLM rather than computed from `severity` and `category`, so it is compared as its own decision field rather than derived. Computing it in deterministic code after consensus would remove one source of disagreement.
+- Very long narratives may need truncation.
+
+## Reusing this pattern
+
+The validator shape generalises to any scored assessment where the middle of the scale is noisy but a threshold is consequential:
+
+- Credit or counterparty risk scoring with a hard gate at a default-probability threshold
+- Content moderation severity with a gate at the takedown line
+- Equipment condition scoring where "run to failure" vs "shut down now" must not blur
+- Vendor SLA breach grading with a gate at penalty-triggering tiers
+
+Keep the four-part comparison: exact match on categorical decisions, band agreement at the consequential threshold, tolerance within the band, no comparison at all on free-text reasoning.
 
 ## Running it
 
-Open [studio.genlayer.com](https://studio.genlayer.com), create a new contract file, paste `incident_adjudicator.py`, and deploy. Call `assess_incident` with any incident narrative.
+**Contract:** open [studio.genlayer.com](https://studio.genlayer.com), create a new contract file, paste `incident_adjudicator.py`, and deploy.
+
+**Frontend:** `index.html` is standalone. Update the `CONTRACT` constant if you deploy your own instance.
+
+## Deployed instance
+
+`0x9AE9D84Bc940dc77FBF243A71e78A413e2897470` — [view on explorer](https://explorer-studio.genlayer.com/address/0x9AE9D84Bc940dc77FBF243A71e78A413e2897470)
 
 ## License
 

@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Incident Severity Adjudicator — GenLayer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #0d1117; color: #e6edf3;
+    display: flex; justify-content: center;
+    padding: 48px 20px; line-height: 1.6;
+  }
+  .wrap { width: 100%; max-width: 680px; }
+  h1 { font-size: 22px; font-weight: 600; margin-bottom: 6px; }
+  .sub { color: #8b949e; font-size: 13px; margin-bottom: 28px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 22px; margin-bottom: 18px; }
+  label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .5px; }
+  input, textarea {
+    width: 100%; padding: 10px 12px; margin-bottom: 16px;
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+    color: #e6edf3; font-family: inherit; font-size: 14px; resize: vertical;
+  }
+  textarea { min-height: 130px; line-height: 1.5; }
+  input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+  button {
+    padding: 10px 18px; border: none; border-radius: 6px;
+    background: #238636; color: #fff; font-family: inherit;
+    font-size: 14px; cursor: pointer; margin-right: 8px;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+  button.alt { background: #21262d; border: 1px solid #30363d; color: #e6edf3; }
+  #out { white-space: pre-wrap; font-size: 13px; color: #8b949e; min-height: 24px; word-break: break-word; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+  .cat { background: #1f2a3d; color: #79c0ff; }
+  .sev-low { background: #1a3f24; color: #3fb950; }
+  .sev-mid { background: #4a3a12; color: #d29922; }
+  .sev-high { background: #4a1e1e; color: #f85149; }
+  .esc-yes { background: #4a1e1e; color: #f85149; }
+  .esc-no { background: #30363d; color: #8b949e; }
+  .samples { font-size: 12px; color: #8b949e; margin-bottom: 14px; }
+  .samples a { color: #58a6ff; cursor: pointer; margin-right: 14px; }
+  a { color: #58a6ff; text-decoration: none; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Incident Severity Adjudicator</h1>
+  <p class="sub">Workplace safety incidents classified on-chain. Validators re-score independently — &plusmn;1 tolerance in the middle of the scale, zero tolerance above severity 8.</p>
+
+  <div class="card">
+    <label>Incident ID</label>
+    <input id="iid" value="INC005">
+
+    <label>Incident report</label>
+    <div class="samples">
+      Load sample:
+      <a id="s1">near miss</a><a id="s2">medical treatment</a><a id="s3">critical</a>
+    </div>
+    <textarea id="report" placeholder="Describe what happened..."></textarea>
+
+    <button id="assess">Assess on-chain</button>
+    <button id="read" class="alt">Read stored assessment</button>
+  </div>
+
+  <div class="card">
+    <div id="out">Loading SDK...</div>
+  </div>
+
+  <a href="https://explorer-studio.genlayer.com/address/0xbD6B086C3E11B3eac6377CEcFd5a02CA089a7828" target="_blank">
+    Contract: 0xbD6B086C3E11B3eac6377CEcFd5a02CA089a7828 &#8599;
+  </a>
+</div>
+
+<script type="module">
+const out = document.getElementById('out');
+const log = (t) => { out.textContent = t; };
+const CONTRACT = '0xbD6B086C3E11B3eac6377CEcFd5a02CA089a7828';
+
+const SAMPLES = {
+  s1: 'Operator noticed a coolant puddle near pump station 3 during morning rounds. Area was cordoned off and cleaned within 20 minutes. No one slipped, no injury, no equipment damage. Root cause was a loose flange gasket, replaced same shift.',
+  s2: 'A fitter lacerated his left hand on a burr while removing a pump casing. The wound required six sutures at the plant medical centre and a course of prescription antibiotics. He was placed on restricted duties for five days, then returned to full duties.',
+  s3: 'During night shift a contractor working on the effluent line scaffold fell approximately 4 metres after a guardrail section gave way. He sustained a fractured femur and was transported to hospital by ambulance. He is expected to be off work for at least eight weeks.'
+};
+for (const k of Object.keys(SAMPLES)) {
+  document.getElementById(k).onclick = () => { document.getElementById('report').value = SAMPLES[k]; };
+}
+
+let client = null;
+try {
+  const sdk = await import('https://cdn.jsdelivr.net/npm/genlayer-js@latest/+esm');
+  const chains = await import('https://cdn.jsdelivr.net/npm/genlayer-js@latest/chains/+esm');
+  client = sdk.createClient({ chain: chains.studionet, account: sdk.createAccount() });
+  log('Connected to GenLayer Studio network. Ready.');
+} catch (e) {
+  log('SDK LOAD FAILED:\n' + e.message);
+  console.error(e);
+}
+
+function render(iid, raw) {
+  const parts = String(raw).split('|').map(s => s.trim());
+  const cat = parts[0] || '';
+  const sev = parseInt((parts[1] || '').replace(/\D/g, ''), 10) || 0;
+  const esc = (parts[2] || '').includes('yes') ? 'yes' : 'no';
+  const sevCls = sev >= 8 ? 'sev-high' : sev >= 4 ? 'sev-mid' : 'sev-low';
+  out.innerHTML =
+    '<div class="row">' +
+    '<strong>' + iid + '</strong>' +
+    '<span class="badge cat">' + cat + '</span>' +
+    '<span class="badge ' + sevCls + '">severity ' + sev + '</span>' +
+    '<span class="badge ' + (esc === 'yes' ? 'esc-yes' : 'esc-no') + '">escalate: ' + esc + '</span>' +
+    '</div>';
+}
+
+document.getElementById('assess').onclick = async () => {
+  if (!client) return log('SDK not loaded.');
+  const iid = document.getElementById('iid').value.trim();
+  const report = document.getElementById('report').value.trim();
+  if (!iid || !report) return log('Incident ID and report both required.');
+
+  const btn = document.getElementById('assess');
+  btn.disabled = true;
+  log('Submitting transaction...\nLeader classifies the narrative, validators independently re-classify and compare.\nThis takes 30-90s.');
+
+  try {
+    const hash = await client.writeContract({
+      address: CONTRACT, functionName: 'assess_incident',
+      args: [iid, report], value: 0n,
+    });
+    log('Tx sent: ' + hash + '\nWaiting for consensus...');
+    await client.waitForTransactionReceipt({ hash, status: 'ACCEPTED', retries: 120, interval: 5000 });
+    const res = await client.readContract({
+      address: CONTRACT, functionName: 'get_assessment', args: [iid],
+    });
+    render(iid, res);
+  } catch (e) {
+    log('Error: ' + e.message);
+  }
+  btn.disabled = false;
+};
+
+document.getElementById('read').onclick = async () => {
+  if (!client) return log('SDK not loaded.');
+  const iid = document.getElementById('iid').value.trim();
+  if (!iid) return log('Incident ID required.');
+  log('Reading...');
+  try {
+    const res = await client.readContract({
+      address: CONTRACT, functionName: 'get_assessment', args: [iid],
+    });
+    render(iid, res);
+  } catch (e) {
+    log('Error: ' + e.message);
+  }
+};
+</script>
+</body>
+</html>

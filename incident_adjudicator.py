@@ -3,6 +3,8 @@
 from genlayer import *
 import json
 
+CRITICAL_THRESHOLD = 8
+
 
 class Contract(gl.Contract):
     severity: TreeMap[str, str]
@@ -45,17 +47,18 @@ Return ONLY JSON, no markdown:
             ls = int(theirs["severity"])
             vs = int(mine["severity"])
 
-            # category and escalation decision must match exactly
+            # categorical decisions must match exactly
             if theirs["category"] != mine["category"]:
                 return False
             if theirs["escalate"] != mine["escalate"]:
                 return False
 
-            # critical band: no tolerance allowed
-            if ls >= 8 or vs >= 8:
-                return ls == vs
+            # both sides must agree on which side of the critical
+            # threshold this sits — the boundary itself is never blurred
+            if (ls >= CRITICAL_THRESHOLD) != (vs >= CRITICAL_THRESHOLD):
+                return False
 
-            # otherwise +/- 1 tolerance on the score
+            # within whichever band both agree on, allow +/- 1
             return abs(ls - vs) <= 1
 
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)

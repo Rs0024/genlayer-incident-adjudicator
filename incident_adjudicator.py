@@ -1,77 +1,101 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
-
 from genlayer import *
-import json
-
-CRITICAL_THRESHOLD = 8
 
 
-class Contract(gl.Contract):
-    severity: TreeMap[str, str]
-    category: TreeMap[str, str]
-    escalate: TreeMap[str, str]
-    rationale: TreeMap[str, str]
+class IncidentAdjudicator(gl.Contract):
+    """
+    Workplace safety incident adjudication with real financial stake.
+    A company deposits a safety fund. A reporter files an incident with
+    a narrative AND an evidence URL (photo, official report, log, etc).
+    GenLayer validators fetch and cross-check the evidence against the
+    narrative before classifying severity. If verified as critical, a
+    payout is released from the fund to the reporter; otherwise the
+    claim is rejected and funds stay with the company.
+    """
 
-    def __init__(self):
-        pass
+    company: Address
+    reporter: Address
+    payout_amount: u256
+    narrative: str
+    evidence_url: str
+    severity: str   # "" -> "minor" / "critical" / "rejected"
+    status: str     # "pending" -> "filed" -> "settled"
+
+    def __init__(self, reporter: Address, payout_amount: u256):
+        self.company = gl.message.sender_address
+        self.reporter = reporter
+        self.payout_amount = payout_amount
+        self.narrative = ""
+        self.evidence_url = ""
+        self.severity = ""
+        self.status = "pending"
 
     @gl.public.write
-    def assess_incident(self, incident_id: str, report: str):
-        def leader_fn():
-            prompt = f"""You are a workplace safety incident classifier.
+    def file_incident(self, narrative: str, evidence_url: str) -> None:
+        if gl.message.sender_address != self.reporter:
+            raise Exception("Only the registered reporter can file an incident")
+        if self.status != "pending":
+            raise Exception("An incident has already been filed for this case")
+        self.narrative = narrative
+        self.evidence_url = evidence_url
+        self.status = "filed"
 
-Incident report:
-{report}
+    @gl.public.write
+    def adjudicate(self) -> None:
+        if self.status != "filed":
+            raise Exception("No filed incident awaiting adjudication")
 
-Classify using this scale:
-- category: one of "near_miss", "first_aid", "medical_treatment", "lost_time", "major"
-- severity: integer 1-10 where 1-3 minor, 4-7 significant, 8-10 critical
-- escalate: "yes" if severity >= 7 or category is "lost_time" or "major", else "no"
+        narrative = self.narrative
+        evidence_url = self.evidence_url
 
-Return ONLY JSON, no markdown:
-{{
-  "category": "...",
-  "severity": 0,
-  "escalate": "yes" or "no",
-  "rationale": "one short line"
-}}"""
-            return json.loads(gl.nondet.exec_prompt(prompt))
+        def classify() -> str:
+            evidence_content = gl.nondet.web.render(evidence_url, mode="text")
+            prompt = f"""
+            Incident narrative reported by the worker:
+            {narrative}
 
-        def validator_fn(leader_result) -> bool:
-            if not isinstance(leader_result, gl.vm.Return):
-                return False
+            Independent evidence fetched from the submitted URL (photo caption,
+            official report, or log — treat this as the ground truth to check
+            the narrative against):
+            {evidence_content}
 
-            mine = leader_fn()
-            theirs = leader_result.calldata
+            Does the evidence genuinely support the narrative's claim of a
+            workplace safety incident? Classify strictly as one of:
+            "critical" (evidence confirms a serious incident matching the
+            narrative), "minor" (evidence confirms a low-severity incident),
+            or "rejected" (evidence does not support the narrative, is
+            missing, or is inconsistent).
+            Answer with exactly one word: critical, minor, or rejected.
+            """
+            result = gl.nondet.exec_prompt(prompt).strip().lower()
+            if "critical" in result:
+                return "critical"
+            if "minor" in result:
+                return "minor"
+            return "rejected"
 
-            ls = int(theirs["severity"])
-            vs = int(mine["severity"])
+        verdict = gl.eq_principle.prompt_comparative(
+            classify,
+            "All validators must independently fetch the evidence URL and "
+            "agree on the same severity classification based on whether the "
+            "evidence actually supports the narrative.",
+        )
 
-            # categorical decisions must match exactly
-            if theirs["category"] != mine["category"]:
-                return False
-            if theirs["escalate"] != mine["escalate"]:
-                return False
-
-            # both sides must agree on which side of the critical
-            # threshold this sits — the boundary itself is never blurred
-            if (ls >= CRITICAL_THRESHOLD) != (vs >= CRITICAL_THRESHOLD):
-                return False
-
-            # within whichever band both agree on, allow +/- 1
-            return abs(ls - vs) <= 1
-
-        result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
-
-        self.severity[incident_id] = str(result["severity"])
-        self.category[incident_id] = result["category"]
-        self.escalate[incident_id] = result["escalate"]
-        self.rationale[incident_id] = result["rationale"]
+        self.severity = verdict
+        self.status = "settled"
 
     @gl.public.view
-    def get_assessment(self, incident_id: str) -> str:
-        return (
-            self.category[incident_id]
-            + " | severity " + self.severity[incident_id]
-            + " | escalate: " + self.escalate[incident_id]
-        )
+    def get_payout_eligible(self) -> bool:
+        return self.status == "settled" and self.severity == "critical"
+
+    @gl.public.view
+    def get_details(self) -> dict:
+        return {
+            "company": str(self.company),
+            "reporter": str(self.reporter),
+            "payout_amount": self.payout_amount,
+            "narrative": self.narrative,
+            "evidence_url": self.evidence_url,
+            "severity": self.severity,
+            "status": self.status,
+        }
